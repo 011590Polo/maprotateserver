@@ -6,10 +6,10 @@ import cors from 'cors';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import {
-  initDatabase,
+  initDatabase,   // Inicializa la base de datos
   getAllMarcadores,
   getMarcadorById,
-  createMarcador,
+  createMarcador, 
   updateMarcador,
   deleteMarcador,
   saveCoordenadaGPS,
