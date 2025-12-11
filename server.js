@@ -11,7 +11,7 @@ import {
   getMarcadorById,
   createMarcador, 
   updateMarcador,
-  deleteMarcador,
+  deleteMarcador,//comentario
   saveCoordenadaGPS,
   getUltimasCoordenadas,
   getCoordenadasPorRango,
@@ -19,7 +19,9 @@ import {
   registrarOActualizarUsuario,
   getUsuarioById,
   getUsuariosConectados,
-  closeDatabase
+  closeDatabase,
+  verificarCredenciales,
+  crearUsuariosEjemplo
 } from './database.js';
 import { upload, getFileUrl, deleteFile } from './utils/fileUpload.js';
 
@@ -70,6 +72,8 @@ app.use('/api/files', express.static(join(__dirname, 'storage')));
 
 // Inicializar base de datos
 initDatabase();
+// Crear usuarios de ejemplo después de inicializar la base de datos
+crearUsuariosEjemplo();
 
 // ==================== RUTAS API ====================
 
@@ -365,6 +369,9 @@ const usuariosNotificados = new Map();
 // Mapa para almacenar las últimas ubicaciones de cada usuario conectado
 // Estructura: { userId: { lat, lng, speed, timestamp } }
 const ultimasUbicaciones = new Map();
+// Mapa para almacenar usuarios logueados con su información
+// Estructura: { socketId: { usuario, rol, estado } }
+const usuariosLogueados = new Map();
 
 io.on('connection', (socket) => {
   console.log(`✅ Cliente conectado: ${socket.id}`);
@@ -580,7 +587,145 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ==================== LOGIN ====================
+  socket.on('login', (data) => {
+    try {
+      const { usuario, clave } = data;
+
+      if (!usuario || !clave) {
+        socket.emit('login-respuesta', {
+          success: false,
+          error: 'Usuario y contraseña son requeridos'
+        });
+        return;
+      }
+
+      // Verificar credenciales
+      const usuarioEncontrado = verificarCredenciales(usuario, clave);
+
+      if (usuarioEncontrado) {
+        // Login exitoso
+        // Guardar información del usuario en el socket
+        socket.userLogin = {
+          id: usuarioEncontrado.id,
+          usuario: usuarioEncontrado.usuario,
+          rol: usuarioEncontrado.rol,
+          estado: usuarioEncontrado.estado
+        };
+
+        // Guardar en el mapa de usuarios logueados
+        usuariosLogueados.set(socket.id, {
+          usuario: usuarioEncontrado.usuario,
+          rol: usuarioEncontrado.rol,
+          estado: usuarioEncontrado.estado
+        });
+
+        socket.emit('login-respuesta', {
+          success: true,
+          usuario: {
+            id: usuarioEncontrado.id,
+            usuario: usuarioEncontrado.usuario,
+            rol: usuarioEncontrado.rol,
+            estado: usuarioEncontrado.estado
+          }
+        });
+
+        console.log(`✅ Login exitoso: ${usuario} (rol: ${usuarioEncontrado.rol})`);
+
+        // Si el usuario es conductor, notificar a todos los usuarios conectados
+        if (usuarioEncontrado.rol === 'conductor') {
+          io.emit('notificacion-conductor', {
+            tipo: 'activo',
+            usuario: usuarioEncontrado.usuario,
+            mensaje: `Conductor: ${usuarioEncontrado.usuario} activo`
+          });
+          console.log(`📢 Notificación enviada: Conductor ${usuarioEncontrado.usuario} activo`);
+        }
+
+        // Notificar a los conductores conectados sobre el nuevo login
+        usuariosLogueados.forEach((userInfo, socketId) => {
+          if (userInfo.rol === 'conductor' && socketId !== socket.id) {
+            const conductorSocket = io.sockets.sockets.get(socketId);
+            if (conductorSocket) {
+              conductorSocket.emit('notificacion-usuario-logueado', {
+                usuario: usuarioEncontrado.usuario,
+                rol: usuarioEncontrado.rol,
+                mensaje: `Usuario ${usuarioEncontrado.usuario} (${usuarioEncontrado.rol}) ha iniciado sesión`
+              });
+            }
+          }
+        });
+      } else {
+        // Credenciales inválidas
+        socket.emit('login-respuesta', {
+          success: false,
+          error: 'Usuario o contraseña incorrectos'
+        });
+        console.log(`❌ Intento de login fallido: ${usuario}`);
+      }
+    } catch (error) {
+      console.error('❌ Error al procesar login:', error);
+      socket.emit('login-respuesta', {
+        success: false,
+        error: 'Error al procesar el login. Intente nuevamente.'
+      });
+    }
+  });
+
+  // ==================== LOGOUT ====================
+  socket.on('logout', () => {
+    try {
+      if (socket.userLogin) {
+        const usuario = socket.userLogin.usuario;
+        const rol = socket.userLogin.rol;
+        
+        // Si el usuario es conductor, notificar a todos los usuarios conectados
+        if (rol === 'conductor') {
+          io.emit('notificacion-conductor', {
+            tipo: 'inactivo',
+            usuario: usuario,
+            mensaje: `Conductor: ${usuario} inactivo`
+          });
+          console.log(`📢 Notificación enviada: Conductor ${usuario} inactivo`);
+        }
+
+        // Limpiar información del usuario del socket
+        delete socket.userLogin;
+        usuariosLogueados.delete(socket.id);
+        console.log(`✅ Logout exitoso: ${usuario}`);
+      }
+      // Confirmar logout al cliente
+      socket.emit('logout-respuesta', {
+        success: true
+      });
+    } catch (error) {
+      console.error('❌ Error al procesar logout:', error);
+      socket.emit('logout-respuesta', {
+        success: false,
+        error: 'Error al cerrar sesión'
+      });
+    }
+  });
+
   socket.on('disconnect', async () => {
+    // Limpiar usuario logueado si existe
+    if (socket.userLogin) {
+      const usuario = socket.userLogin.usuario;
+      const rol = socket.userLogin.rol;
+      
+      // Si el usuario es conductor, notificar a todos los usuarios conectados
+      if (rol === 'conductor') {
+        io.emit('notificacion-conductor', {
+          tipo: 'inactivo',
+          usuario: usuario,
+          mensaje: `Conductor: ${usuario} inactivo`
+        });
+        console.log(`📢 Notificación enviada (disconnect): Conductor ${usuario} inactivo`);
+      }
+      
+      usuariosLogueados.delete(socket.id);
+    }
+
     const userId = socket.userId || null;
     
     if (userId) {

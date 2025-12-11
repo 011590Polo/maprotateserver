@@ -16,7 +16,19 @@ db.pragma('foreign_keys = ON');
  * Inicializa la base de datos creando las tablas necesarias
  */
 export function initDatabase() {
-  // Tabla de usuarios
+  // Tabla de usuarios de login (autenticación)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS usuarios_login (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      usuario TEXT NOT NULL UNIQUE,
+      clave TEXT NOT NULL,
+      fecha_registro DATETIME DEFAULT CURRENT_TIMESTAMP,
+      estado TEXT NOT NULL DEFAULT 'activo' CHECK(estado IN ('activo', 'inactivo', 'bloqueado')),
+      rol TEXT NOT NULL DEFAULT 'visitante' CHECK(rol IN ('trabajador', 'conductor', 'visitante'))
+    )
+  `);
+
+  // Tabla de usuarios (tracking - mantener compatibilidad)
   db.exec(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id TEXT PRIMARY KEY,
@@ -133,13 +145,148 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_coordenadas_timestamp ON coordenadas_gps(timestamp);
     CREATE INDEX IF NOT EXISTS idx_coordenadas_user_id ON coordenadas_gps(user_id);
     CREATE INDEX IF NOT EXISTS idx_usuarios_ultima_conexion ON usuarios(ultima_conexion);
+    CREATE INDEX IF NOT EXISTS idx_usuarios_login_usuario ON usuarios_login(usuario);
+    CREATE INDEX IF NOT EXISTS idx_usuarios_login_estado ON usuarios_login(estado);
+    CREATE INDEX IF NOT EXISTS idx_usuarios_login_rol ON usuarios_login(rol);
   `);
 
   console.log('✅ Base de datos inicializada correctamente');
 }
 
 /**
- * ==================== USUARIOS ====================
+ * Crea usuarios de ejemplo si no existen
+ * Esta función debe llamarse después de que todas las funciones estén definidas
+ */
+export function crearUsuariosEjemplo() {
+  try {
+    const usuariosEjemplo = [
+      { usuario: 'trabajador', clave: 'trabajador123', rol: 'trabajador' },
+      { usuario: 'conductor', clave: 'conductor123', rol: 'conductor' },
+      { usuario: 'visitante', clave: 'visitante123', rol: 'visitante' }
+    ];
+
+    usuariosEjemplo.forEach(({ usuario, clave, rol }) => {
+      const existe = obtenerUsuarioLoginPorUsuario(usuario);
+      if (!existe) {
+        crearUsuarioLogin(usuario, clave, rol, 'activo');
+        console.log(`✅ Usuario de ejemplo creado: ${usuario} (rol: ${rol})`);
+      } else {
+        console.log(`ℹ️  Usuario de ejemplo ya existe: ${usuario}`);
+      }
+    });
+  } catch (error) {
+    console.warn('⚠️  Advertencia al crear usuarios de ejemplo:', error.message);
+  }
+}
+
+/**
+ * ==================== USUARIOS LOGIN ====================
+ */
+
+/**
+ * Crea un nuevo usuario de login
+ */
+export function crearUsuarioLogin(usuario, clave, rol = 'visitante', estado = 'activo') {
+  const stmt = db.prepare(`
+    INSERT INTO usuarios_login (usuario, clave, rol, estado, fecha_registro)
+    VALUES (?, ?, ?, ?, datetime('now'))
+  `);
+  
+  try {
+    const result = stmt.run(usuario, clave, rol, estado);
+    return obtenerUsuarioLoginPorId(result.lastInsertRowid);
+  } catch (error) {
+    if (error.message.includes('UNIQUE constraint failed')) {
+      throw new Error('El usuario ya existe');
+    }
+    throw error;
+  }
+}
+
+/**
+ * Obtiene un usuario de login por ID
+ */
+export function obtenerUsuarioLoginPorId(id) {
+  const stmt = db.prepare('SELECT * FROM usuarios_login WHERE id = ?');
+  return stmt.get(id);
+}
+
+/**
+ * Obtiene un usuario de login por nombre de usuario
+ */
+export function obtenerUsuarioLoginPorUsuario(usuario) {
+  const stmt = db.prepare('SELECT * FROM usuarios_login WHERE usuario = ?');
+  return stmt.get(usuario);
+}
+
+/**
+ * Obtiene todos los usuarios de login
+ */
+export function obtenerTodosUsuariosLogin() {
+  const stmt = db.prepare('SELECT * FROM usuarios_login ORDER BY fecha_registro DESC');
+  return stmt.all();
+}
+
+/**
+ * Actualiza un usuario de login
+ */
+export function actualizarUsuarioLogin(id, datos) {
+  const { usuario, clave, rol, estado } = datos;
+  
+  let query = 'UPDATE usuarios_login SET ';
+  const params = [];
+  
+  if (usuario !== undefined) {
+    query += 'usuario = ?, ';
+    params.push(usuario);
+  }
+  if (clave !== undefined) {
+    query += 'clave = ?, ';
+    params.push(clave);
+  }
+  if (rol !== undefined) {
+    query += 'rol = ?, ';
+    params.push(rol);
+  }
+  if (estado !== undefined) {
+    query += 'estado = ?, ';
+    params.push(estado);
+  }
+  
+  // Remover la última coma y espacio
+  query = query.slice(0, -2);
+  query += ' WHERE id = ?';
+  params.push(id);
+  
+  const stmt = db.prepare(query);
+  const result = stmt.run(...params);
+  
+  if (result.changes === 0) {
+    return null;
+  }
+  
+  return obtenerUsuarioLoginPorId(id);
+}
+
+/**
+ * Elimina un usuario de login
+ */
+export function eliminarUsuarioLogin(id) {
+  const stmt = db.prepare('DELETE FROM usuarios_login WHERE id = ?');
+  const result = stmt.run(id);
+  return result.changes > 0;
+}
+
+/**
+ * Verifica las credenciales de un usuario
+ */
+export function verificarCredenciales(usuario, clave) {
+  const stmt = db.prepare('SELECT * FROM usuarios_login WHERE usuario = ? AND clave = ? AND estado = ?');
+  return stmt.get(usuario, clave, 'activo');
+}
+
+/**
+ * ==================== USUARIOS (TRACKING) ====================
  */
 
 /**
