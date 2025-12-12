@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { v4 as uuidv4 } from 'uuid';
@@ -137,6 +138,19 @@ export function initDatabase() {
     }
   }
 
+  // Tabla para tokens de sesión
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sesiones (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token TEXT NOT NULL UNIQUE,
+      usuario_id INTEGER NOT NULL,
+      fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
+      fecha_expiracion DATETIME NOT NULL,
+      activo INTEGER DEFAULT 1,
+      FOREIGN KEY (usuario_id) REFERENCES usuarios_login(id) ON DELETE CASCADE
+    )
+  `);
+
   // Índices para mejorar el rendimiento
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_marcadores_categoria ON marcadores(categoria);
@@ -148,6 +162,9 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_usuarios_login_usuario ON usuarios_login(usuario);
     CREATE INDEX IF NOT EXISTS idx_usuarios_login_estado ON usuarios_login(estado);
     CREATE INDEX IF NOT EXISTS idx_usuarios_login_rol ON usuarios_login(rol);
+    CREATE INDEX IF NOT EXISTS idx_sesiones_token ON sesiones(token);
+    CREATE INDEX IF NOT EXISTS idx_sesiones_usuario_id ON sesiones(usuario_id);
+    CREATE INDEX IF NOT EXISTS idx_sesiones_activo ON sesiones(activo);
   `);
 
   console.log('✅ Base de datos inicializada correctamente');
@@ -283,6 +300,82 @@ export function eliminarUsuarioLogin(id) {
 export function verificarCredenciales(usuario, clave) {
   const stmt = db.prepare('SELECT * FROM usuarios_login WHERE usuario = ? AND clave = ? AND estado = ?');
   return stmt.get(usuario, clave, 'activo');
+}
+
+/**
+ * ==================== SESIONES (TOKENS) ====================
+ */
+
+/**
+ * Crea un nuevo token de sesión
+ * @param {number} usuarioId - ID del usuario
+ * @param {number} diasExpiracion - Días hasta que expire el token (default: 30)
+ * @returns {string} Token generado
+ */
+export function crearTokenSesion(usuarioId, diasExpiracion = 30) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const fechaExpiracion = new Date();
+  fechaExpiracion.setDate(fechaExpiracion.getDate() + diasExpiracion);
+  
+  const stmt = db.prepare(`
+    INSERT INTO sesiones (token, usuario_id, fecha_expiracion)
+    VALUES (?, ?, datetime(?))
+  `);
+  
+  stmt.run(token, usuarioId, fechaExpiracion.toISOString());
+  return token;
+}
+
+/**
+ * Valida un token de sesión y retorna el usuario asociado
+ * @param {string} token - Token a validar
+ * @returns {object|null} Usuario asociado o null si el token es inválido
+ */
+export function validarTokenSesion(token) {
+  if (!token || typeof token !== 'string') {
+    return null;
+  }
+  
+  const stmt = db.prepare(`
+    SELECT u.*, s.fecha_creacion, s.fecha_expiracion
+    FROM sesiones s
+    INNER JOIN usuarios_login u ON s.usuario_id = u.id
+    WHERE s.token = ? 
+      AND s.activo = 1 
+      AND datetime('now') < datetime(s.fecha_expiracion)
+      AND u.estado = 'activo'
+  `);
+  
+  return stmt.get(token) || null;
+}
+
+/**
+ * Invalida un token de sesión (logout)
+ * @param {string} token - Token a invalidar
+ */
+export function invalidarTokenSesion(token) {
+  const stmt = db.prepare('UPDATE sesiones SET activo = 0 WHERE token = ?');
+  stmt.run(token);
+}
+
+/**
+ * Invalida todos los tokens de un usuario
+ * @param {number} usuarioId - ID del usuario
+ */
+export function invalidarTodosTokensUsuario(usuarioId) {
+  const stmt = db.prepare('UPDATE sesiones SET activo = 0 WHERE usuario_id = ?');
+  stmt.run(usuarioId);
+}
+
+/**
+ * Limpia tokens expirados
+ */
+export function limpiarTokensExpirados() {
+  const stmt = db.prepare('DELETE FROM sesiones WHERE datetime(\'now\') > datetime(fecha_expiracion)');
+  const result = stmt.run();
+  if (result.changes > 0) {
+    console.log(`🧹 Limpiados ${result.changes} tokens expirados`);
+  }
 }
 
 /**

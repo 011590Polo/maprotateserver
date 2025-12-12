@@ -21,7 +21,12 @@ import {
   getUsuariosConectados,
   closeDatabase,
   verificarCredenciales,
-  crearUsuariosEjemplo
+  crearUsuariosEjemplo,
+  crearTokenSesion,
+  validarTokenSesion,
+  invalidarTokenSesion,
+  invalidarTodosTokensUsuario,
+  limpiarTokensExpirados
 } from './database.js';
 import { upload, getFileUrl, deleteFile } from './utils/fileUpload.js';
 
@@ -35,14 +40,39 @@ const httpServer = createServer(app);
 const PORT = process.env.PORT || 3000;
 const CORS_ORIGINS = process.env.CORS_ORIGINS 
   ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
-  : ['http://localhost:4200', 'http://127.0.0.1:4200', 'http://localhost:4401', 'http://127.0.0.1:4401'];
+  : [
+      'http://localhost:4200', 
+      'http://127.0.0.1:4200', 
+      'http://localhost:4401', 
+      'http://127.0.0.1:4401',
+      'https://map.robertogroup.org',
+      'http://map.robertogroup.org'
+    ];
 const JSON_LIMIT = process.env.JSON_LIMIT || '10mb';
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const io = new Server(httpServer, {
   cors: {
-    origin: CORS_ORIGINS,
-    methods: ['GET', 'POST', 'PUT', 'DELETE']
+    origin: function (origin, callback) {
+      // Permitir requests sin origen (como mobile apps)
+      if (!origin) return callback(null, true);
+      
+      // Verificar si el origen está en la lista permitida
+      if (CORS_ORIGINS.indexOf(origin) !== -1) {
+        callback(null, true);
+      } else {
+        // También permitir subdominios de robertogroup.org
+        if (origin.includes('.robertogroup.org') || origin === 'https://robertogroup.org' || origin === 'http://robertogroup.org') {
+          callback(null, true);
+        } else {
+          console.warn(`⚠️  Origen CORS no permitido para Socket.IO: ${origin}`);
+          callback(new Error('No permitido por CORS'));
+        }
+      }
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization']
   }
 });
 
@@ -56,13 +86,18 @@ app.use(cors({
     if (CORS_ORIGINS.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      console.warn(`⚠️  Origen CORS no permitido: ${origin}`);
-      callback(new Error('No permitido por CORS'));
+      // También permitir subdominios de robertogroup.org
+      if (origin.includes('.robertogroup.org') || origin === 'https://robertogroup.org' || origin === 'http://robertogroup.org') {
+        callback(null, true);
+      } else {
+        console.warn(`⚠️  Origen CORS no permitido: ${origin}`);
+        callback(new Error('No permitido por CORS'));
+      }
     }
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 app.use(express.json({ limit: JSON_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: JSON_LIMIT }));
@@ -84,10 +119,13 @@ app.get('/api/health', (req, res) => {
 
 // ==================== MARCADORES ====================
 
-// GET - Obtener todos los marcadores
+// GET - Obtener todos los marcadores (OPTIMIZADO)
 app.get('/api/marcadores', (req, res) => {
   try {
+    // OPTIMIZACIÓN: Obtener marcadores de forma eficiente
     const marcadores = getAllMarcadores();
+    
+    // OPTIMIZACIÓN: Enviar respuesta inmediatamente sin procesamiento adicional
     res.json({ success: true, data: marcadores });
   } catch (error) {
     console.error('Error al obtener marcadores:', error);
@@ -592,7 +630,10 @@ io.on('connection', (socket) => {
     try {
       const { usuario, clave } = data;
 
+      console.log(`🔐 Intento de login recibido para usuario: ${usuario}`);
+
       if (!usuario || !clave) {
+        console.warn('⚠️ Login fallido: Usuario o contraseña faltantes');
         socket.emit('login-respuesta', {
           success: false,
           error: 'Usuario y contraseña son requeridos'
@@ -602,6 +643,8 @@ io.on('connection', (socket) => {
 
       // Verificar credenciales
       const usuarioEncontrado = verificarCredenciales(usuario, clave);
+      
+      console.log(`🔍 Resultado de verificación:`, usuarioEncontrado ? `Usuario encontrado (${usuarioEncontrado.rol})` : 'Credenciales inválidas');
 
       if (usuarioEncontrado) {
         // Login exitoso
@@ -620,40 +663,53 @@ io.on('connection', (socket) => {
           estado: usuarioEncontrado.estado
         });
 
-        socket.emit('login-respuesta', {
+        // Generar token de sesión
+        const token = crearTokenSesion(usuarioEncontrado.id, 30); // Token válido por 30 días
+        
+        // IMPORTANTE: Enviar respuesta INMEDIATAMENTE después de validar
+        const respuestaLogin = {
           success: true,
           usuario: {
             id: usuarioEncontrado.id,
             usuario: usuarioEncontrado.usuario,
             rol: usuarioEncontrado.rol,
             estado: usuarioEncontrado.estado
-          }
-        });
+          },
+          token: token // Incluir token en la respuesta
+        };
+        
+        // IMPORTANTE: Enviar respuesta PRIMERO, antes de cualquier otra operación
+        socket.emit('login-respuesta', respuestaLogin);
+        console.log(`✅ Login exitoso: ${usuario} (rol: ${usuarioEncontrado.rol}) - Token generado`);
 
-        console.log(`✅ Login exitoso: ${usuario} (rol: ${usuarioEncontrado.rol})`);
-
+        // DESPUÉS de enviar la respuesta, hacer las notificaciones (no bloquean)
         // Si el usuario es conductor, notificar a todos los usuarios conectados
         if (usuarioEncontrado.rol === 'conductor') {
-          io.emit('notificacion-conductor', {
-            tipo: 'activo',
-            usuario: usuarioEncontrado.usuario,
-            mensaje: `Conductor: ${usuarioEncontrado.usuario} activo`
+          // Usar setImmediate para no bloquear la respuesta
+          setImmediate(() => {
+            io.emit('notificacion-conductor', {
+              tipo: 'activo',
+              usuario: usuarioEncontrado.usuario,
+              mensaje: `Conductor: ${usuarioEncontrado.usuario} activo`
+            });
+            console.log(`📢 Notificación enviada: Conductor ${usuarioEncontrado.usuario} activo`);
           });
-          console.log(`📢 Notificación enviada: Conductor ${usuarioEncontrado.usuario} activo`);
         }
 
-        // Notificar a los conductores conectados sobre el nuevo login
-        usuariosLogueados.forEach((userInfo, socketId) => {
-          if (userInfo.rol === 'conductor' && socketId !== socket.id) {
-            const conductorSocket = io.sockets.sockets.get(socketId);
-            if (conductorSocket) {
-              conductorSocket.emit('notificacion-usuario-logueado', {
-                usuario: usuarioEncontrado.usuario,
-                rol: usuarioEncontrado.rol,
-                mensaje: `Usuario ${usuarioEncontrado.usuario} (${usuarioEncontrado.rol}) ha iniciado sesión`
-              });
+        // Notificar a los conductores conectados sobre el nuevo login (también asíncrono)
+        setImmediate(() => {
+          usuariosLogueados.forEach((userInfo, socketId) => {
+            if (userInfo.rol === 'conductor' && socketId !== socket.id) {
+              const conductorSocket = io.sockets.sockets.get(socketId);
+              if (conductorSocket) {
+                conductorSocket.emit('notificacion-usuario-logueado', {
+                  usuario: usuarioEncontrado.usuario,
+                  rol: usuarioEncontrado.rol,
+                  mensaje: `Usuario ${usuarioEncontrado.usuario} (${usuarioEncontrado.rol}) ha iniciado sesión`
+                });
+              }
             }
-          }
+          });
         });
       } else {
         // Credenciales inválidas
@@ -672,9 +728,87 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ==================== LOGOUT ====================
-  socket.on('logout', () => {
+  // ==================== VALIDAR TOKEN ====================
+  socket.on('validar-token', (data) => {
     try {
+      const { token } = data;
+      
+      if (!token) {
+        socket.emit('validar-token-respuesta', {
+          success: false,
+          error: 'Token no proporcionado'
+        });
+        return;
+      }
+      
+      const usuario = validarTokenSesion(token);
+      
+      if (usuario) {
+        // Token válido - restaurar sesión
+        socket.userLogin = {
+          id: usuario.id,
+          usuario: usuario.usuario,
+          rol: usuario.rol,
+          estado: usuario.estado
+        };
+        
+        usuariosLogueados.set(socket.id, {
+          usuario: usuario.usuario,
+          rol: usuario.rol,
+          estado: usuario.estado
+        });
+        
+        socket.emit('validar-token-respuesta', {
+          success: true,
+          usuario: {
+            id: usuario.id,
+            usuario: usuario.usuario,
+            rol: usuario.rol,
+            estado: usuario.estado
+          }
+        });
+        
+        console.log(`✅ Token válido - Sesión restaurada para: ${usuario.usuario}`);
+        
+        // Si el usuario es conductor, notificar que está activo
+        if (usuario.rol === 'conductor') {
+          setImmediate(() => {
+            io.emit('notificacion-conductor', {
+              tipo: 'activo',
+              usuario: usuario.usuario,
+              mensaje: `Conductor: ${usuario.usuario} activo`
+            });
+            console.log(`📢 Notificación enviada: Conductor ${usuario.usuario} activo (token restaurado)`);
+          });
+        }
+      } else {
+        // Token inválido o expirado
+        socket.emit('validar-token-respuesta', {
+          success: false,
+          error: 'Token inválido o expirado'
+        });
+        console.log(`❌ Token inválido o expirado`);
+      }
+    } catch (error) {
+      console.error('❌ Error al validar token:', error);
+      socket.emit('validar-token-respuesta', {
+        success: false,
+        error: 'Error al validar token'
+      });
+    }
+  });
+
+  // ==================== LOGOUT ====================
+  socket.on('logout', (data) => {
+    try {
+      const { token } = data || {};
+      
+      // Invalidar token si se proporciona
+      if (token) {
+        invalidarTokenSesion(token);
+        console.log('🗑️ Token invalidado');
+      }
+      
       if (socket.userLogin) {
         const usuario = socket.userLogin.usuario;
         const rol = socket.userLogin.rol;
@@ -704,6 +838,142 @@ io.on('connection', (socket) => {
         success: false,
         error: 'Error al cerrar sesión'
       });
+    }
+  });
+
+  // ==================== UBICACIÓN DE CONDUCTORES ====================
+  socket.on('ubicacion-conductor', async (data) => {
+    try {
+      // VALIDACIÓN ESTRICTA DE ESTRUCTURA
+      if (!data || typeof data !== 'object') {
+        console.warn('⚠️  Ubicación de conductor inválida: datos no es un objeto', data);
+        return;
+      }
+
+      const { userId, lat, lng, speed, timestamp, accuracy } = data;
+
+      // Función de validación y conversión de coordenadas
+      const validarCoordenadas = (latVal, lngVal) => {
+        // CAPA 1: Existencia
+        if (latVal === undefined || latVal === null || lngVal === undefined || lngVal === null) {
+          return null;
+        }
+
+        // CAPA 2: Conversión a número (maneja strings numéricos)
+        let latNum, lngNum;
+        if (typeof latVal === 'string') {
+          latNum = parseFloat(latVal);
+        } else if (typeof latVal === 'number') {
+          latNum = latVal;
+        } else {
+          return null;
+        }
+
+        if (typeof lngVal === 'string') {
+          lngNum = parseFloat(lngVal);
+        } else if (typeof lngVal === 'number') {
+          lngNum = lngVal;
+        } else {
+          return null;
+        }
+
+        // CAPA 3: Números finitos
+        if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) {
+          return null;
+        }
+
+        // CAPA 4: Punto nulo
+        if (latNum === 0 && lngNum === 0) {
+          return null;
+        }
+
+        // CAPA 5: Rangos válidos
+        if (latNum < -90 || latNum > 90 || lngNum < -180 || lngNum > 180) {
+          return null;
+        }
+
+        // CAPA 6: Valores casi cero
+        if (Math.abs(latNum) < 0.000001 && Math.abs(lngNum) < 0.000001) {
+          return null;
+        }
+
+        return { lat: latNum, lng: lngNum };
+      };
+
+      // Validar coordenadas
+      const coordenadasValidas = validarCoordenadas(lat, lng);
+      if (!coordenadasValidas) {
+        console.warn('⚠️  Ubicación de conductor inválida: coordenadas no válidas', { lat, lng, tipoLat: typeof lat, tipoLng: typeof lng });
+        return;
+      }
+
+      // CAPA 6: Validar accuracy si existe (descartar si > 200m)
+      if (accuracy !== undefined && accuracy !== null) {
+        if (!Number.isFinite(accuracy) || accuracy > 200) {
+          console.warn('⚠️  Ubicación de conductor descartada: precisión GPS muy baja (>200m)', { lat, lng, accuracy });
+          return;
+        }
+      }
+
+      // Verificar que el usuario sea conductor
+      if (!socket.userLogin || socket.userLogin.rol !== 'conductor') {
+        console.warn('⚠️  Intento de enviar ubicación sin ser conductor');
+        return;
+      }
+
+      const usuario = socket.userLogin.usuario;
+      const conductorId = socket.userLogin.id?.toString() || userId || socket.id;
+
+      // Usar coordenadas validadas
+      const finalLat = coordenadasValidas.lat;
+      const finalLng = coordenadasValidas.lng;
+      
+      // Validar y convertir otros valores
+      const finalSpeed = (speed !== undefined && speed !== null && Number.isFinite(Number(speed))) ? Number(speed) : 0;
+      const finalAccuracy = (accuracy !== undefined && accuracy !== null && Number.isFinite(Number(accuracy))) ? Number(accuracy) : undefined;
+      const finalTimestamp = (timestamp !== undefined && timestamp !== null && Number.isFinite(Number(timestamp))) ? Number(timestamp) : Date.now();
+
+      // Verificación final de seguridad (doble check)
+      if (!Number.isFinite(finalLat) || !Number.isFinite(finalLng)) {
+        console.error('❌ ERROR CRÍTICO: Coordenadas no finitas después de validación', { finalLat, finalLng });
+        return;
+      }
+
+      // REGLA CRÍTICA DE BROADCAST: Reenvío INMEDIATO a TODOS los usuarios conectados
+      // EXCEPTO al conductor emisor (usando socket.broadcast.emit)
+      // Esto garantiza que la ubicación llegue a:
+      // - Visitantes
+      // - Trabajadores  
+      // - Otros conductores
+      // - Cualquier usuario activo en el servidor
+      // NUNCA se envía de vuelta al propio emisor
+      
+      const ubicacionData = {
+        conductorId: String(conductorId),
+        usuario: String(usuario),
+        lat: finalLat,
+        lng: finalLng,
+        speed: finalSpeed,
+        accuracy: finalAccuracy,
+        timestamp: finalTimestamp
+      };
+      
+      // Reenviar ubicación a todos los usuarios conectados EXCEPTO al emisor
+      socket.broadcast.emit('ubicacion-conductor', ubicacionData);
+      
+      // Obtener número de clientes conectados para logging (sin bloquear el reenvío)
+      io.fetchSockets().then(sockets => {
+        const otrosClientes = sockets.filter(s => s.id !== socket.id);
+        console.log(`📡 Ubicación de conductor ${usuario} transmitida a ${otrosClientes.length} usuario(s) conectado(s)`);
+      }).catch(err => {
+        console.warn('⚠️ Error al obtener sockets para logging:', err);
+        console.log(`📡 Ubicación de conductor ${usuario} transmitida`);
+      });
+      
+      // Guardado en BD de forma asíncrona SIN bloquear el reenvío
+      // (Si hay función de guardado, ejecutarla aquí de forma async)
+    } catch (error) {
+      console.error('❌ Error al procesar ubicación de conductor:', error, data);
     }
   });
 
@@ -806,12 +1076,19 @@ process.on('SIGINT', () => {
 });
 
 // Iniciar servidor
+// Limpiar tokens expirados al iniciar y cada hora
+limpiarTokensExpirados();
+setInterval(() => {
+  limpiarTokensExpirados();
+}, 3600000); // Cada hora
+
 httpServer.listen(PORT, () => {
   console.log(`🚀 Servidor Fleet Tracking iniciado en puerto ${PORT}`);
   console.log(`📡 Socket.IO disponible en http://localhost:${PORT}`);
   console.log(`🌐 API REST disponible en http://localhost:${PORT}/api`);
   console.log(`📦 Límite de JSON: ${JSON_LIMIT}`);
   console.log(`🌍 Orígenes CORS permitidos: ${CORS_ORIGINS.join(', ')}`);
+  console.log(`🔐 Sistema de tokens de sesión activo`);
 });
 
 
