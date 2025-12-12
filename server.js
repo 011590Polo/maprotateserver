@@ -964,10 +964,10 @@ io.on('connection', (socket) => {
       // Obtener número de clientes conectados para logging (sin bloquear el reenvío)
       io.fetchSockets().then(sockets => {
         const otrosClientes = sockets.filter(s => s.id !== socket.id);
-        console.log(`📡 Ubicación de conductor ${usuario} transmitida a ${otrosClientes.length} usuario(s) conectado(s)`);
+        // console.log(`📡 Ubicación de conductor ${usuario} transmitida a ${otrosClientes.length} usuario(s) conectado(s)`);
       }).catch(err => {
         console.warn('⚠️ Error al obtener sockets para logging:', err);
-        console.log(`📡 Ubicación de conductor ${usuario} transmitida`);
+        // console.log(`📡 Ubicación de conductor ${usuario} transmitida`);
       });
       
       // Guardado en BD de forma asíncrona SIN bloquear el reenvío
